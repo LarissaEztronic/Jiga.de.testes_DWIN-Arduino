@@ -1,0 +1,1108 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Wire.h>
+#include <INA226_WE.h>
+
+#define baudDWIN 115200
+#define baudSerial 115200
+
+#define DwinSerial Serial3
+
+#define INA226_ADDR 0x40
+#define SHUNT_RESISTOR 0.1
+
+#define HDR1 0x5A
+#define HDR2 0xA5
+#define FRAME_TIMEOUT 500
+#define MAX_FRAME 64
+
+#define LIGADO HIGH
+#define DESLIGADO LOW
+
+#define TAM_TEXTO 25
+
+//-----------------------------------------------------------------------------------------
+//------------------------- ENDEREÇOS VP DOS TEXT DISPLAY ---------------------------------
+//-----------------------------------------------------------------------------------------
+
+#define VP_PRODUTO_SELECIONADO 0x3000
+#define VP_PRODUTO_NOME 0x3000
+
+//----------------------------- TELA 1 ----------------------------------------------------
+
+#define VP_TELA1_MENU_BASE 0x1000
+#define VP_TELA1_MENU_PASSO 30
+#define VP_TELA1_MENU_PRODUTO(i) (VP_TELA1_MENU_BASE + ((i)*VP_TELA1_MENU_PASSO))
+
+//----------------------------- TELA 3 ----------------------------------------------------
+
+#define VP_TELA3_ETAPA_EM_TESTE 0x4000
+#define VP_TELA3_TENSAO_TESTE 0x4100
+#define VP_TELA3_CORRENTE_MEDIDA 0x4200
+#define VP_TELA3_MIN_CORRENTE 0x4300
+#define VP_TELA3_MAX_CORRENTE 0x4400
+
+#define VP_TELA3_TENSAO VP_TELA3_TENSAO_TESTE
+#define VP_TELA3_MEDIDA VP_TELA3_CORRENTE_MEDIDA
+#define VP_TELA3_MIN VP_TELA3_MIN_CORRENTE
+#define VP_TELA3_MAX VP_TELA3_MAX_CORRENTE
+
+//-----------------------------------------------------------------------------------------
+//---------------------- ENDEREÇOS VP DOS RETURN KEY CODE ---------------------------------
+//-----------------------------------------------------------------------------------------
+//----------------------------------- TELA 1 ----------------------------------------------
+
+#define KEY_TELA1_PRODUTO_BASE 0x0001
+#define KEY_TELA1_PRODUTO_PASSO 1
+
+#define KEY_TELA1_PAG_ANT 0x00FD
+#define KEY_TELA1_PAG_PROX 0x00FE
+
+//----------------------------- TELA 2 ----------------------------------------------------
+
+#define KEY_TELA2_IR_TESTE 0x7000
+#define KEY_TELA2_TROCAR_PROD 0x7001
+
+//----------------------------- TELA 3 ----------------------------------------------------
+
+#define KEY_TELA3_BOTAO_INICIAR 0x7000
+#define KEY_TELA3_BOTAO_CANCELAR 0x7002
+
+#define KEY_TELA3_HOME 0x8000
+
+//----------------------------- TELA 4 ----------------------------------------------------
+
+#define VP_TELA4_RESULTADO_BASE 0x5000
+#define VP_TELA4_RESULTADO_PASSO 30
+#define VP_TELA4_RESULTADO(i) (VP_TELA4_RESULTADO_BASE + ((i)*VP_TELA4_RESULTADO_PASSO))
+
+const int PIN_SD_CS = 53;
+
+const int R1 = 29;
+const int R2 = 28;
+const int R3 = 31;
+const int R4 = 30;
+const int R5 = 33;
+const int R6 = 32;
+
+const int AUX1 = 48;
+const int AUX2 = 38;
+const int AUX3 = 36;
+
+const int FONTE_12V = 26;
+const int FONTE_24V = 27;
+
+const int LED_APROVADO = 6;
+const int LED_REPROVADO = 7;
+
+INA226_WE ina226 = INA226_WE(INA226_ADDR);
+
+const byte PAGINA_MENU = 1;
+const byte PAGINA_TESTE = 3;
+const byte PAGINA_RESULTADO = 4;
+
+const int TELA1_ITENS_POR_PAGINA = 12;
+const uint16_t TELA1_VP_LISTA = 0x1000;
+
+int paginaListaAtual = 0;
+
+bool testesEmExecucao = false;
+bool autoLoopAtivo = true;
+
+unsigned long tempoTelaResultado = 0;
+bool telaResultadoAtiva = false;
+
+//------------------------------- ENDEREÇOS VP TELA 3 -------------------------------------
+
+const uint16_t TELA3_VP_NOME_ETAPA = 0x4000;
+const uint16_t TELA3_VP_TENSAO = 0x4100;
+const uint16_t TELA3_VP_LEITURA_CORRENTE = 0x4200;
+const uint16_t TELA3_VP_MIN = 0x4300;
+const uint16_t TELA3_VP_MAX = 0x4400;
+
+//------------------------------- ENDEREÇOS VP TELA 4 -------------------------------------
+
+const uint16_t TELA4_VP_NOME_BASE = 0x5000;
+const uint16_t TELA4_VP_ICON_BASE = 0x6000;
+
+//--------------------------- VARIÁVEIS DO PRODUTO ATUAL ----------------------------------
+//----------------------------- (LIDOS PELO DADOS.CSV) ------------------------------------
+
+String nomeProdutoSelecionado = "";
+String produtoTensao = "";
+float produtoMinCorrente = 0.0;
+float produtoMaxCorrente = 0.0;
+
+//--------------------------- STATE MACHINE RECEPÇÃO DE DADOS -----------------------------
+
+enum RX_STATE 
+{
+  WAIT_H1,
+  WAIT_H2,
+  WAIT_LEN,
+  WAIT_DATA
+};
+
+struct DWINFrame 
+{
+  uint8_t data[MAX_FRAME];
+  uint8_t size;
+  bool complete;
+};
+
+
+class DWINReceiver 
+{
+  RX_STATE state = WAIT_H1;
+  uint8_t buf[MAX_FRAME];
+  uint8_t idx = 0;
+  uint8_t len = 0;
+  unsigned long lastByte = 0;
+
+public:
+  DWINFrame frame;
+
+  void reset();
+  void process(uint8_t b);
+}; 
+
+DWINReceiver dwinRX;
+
+struct ResultadoEtapa 
+{
+  String nomeEtapa;
+  bool aprovado;
+  float correnteLida;
+};
+
+const int MAX_ETAPAS = 15;
+ResultadoEtapa resultados[MAX_ETAPAS];
+int totalEtapasRodadas = 0;
+
+
+//--------------------------- PROTÓTIPOS DAS FUNÇÕES ---------------------------
+bool identificarProdutoSelecionado(int slotClicado); 
+float medirCorrente_mA();
+float medirCorrente();
+String splitString(String data, char separator, int index);
+void armazenarProdutoNoVP(String nomeProduto); 
+void atualizarLedsResultadoFinal(); 
+void carregarMenu(int pagina); 
+void carregarPrimeiraEtapaDoProduto(); 
+void desligarTudo();
+void enviarFloatDWIN(uint16_t vp, float valor); 
+void enviarIconeDWIN(uint16_t vp, int idIcone);
+void enviarTextoDWIN(uint16_t vp, String texto, int tamanhoCampo = -1); 
+void executarSequenciaDeTestes(); 
+void ligarReles(String command); 
+void limparTextoVP(uint16_t vp, uint8_t tamanho); 
+void mostrarTelaResultados(); 
+void mudarPaginaDWIN(byte pagina); 
+void processarAcao(byte codigo); 
+void rodarEtapa(String linhaCSV); 
+void tratarFrame(DWINFrame &f); 
+void tratarRelesString(String texto);
+//------------------------------------------------------------------------------
+
+void setup() 
+{
+  desligarTudo();
+
+  delay(2000);
+
+  Serial.begin(baudSerial);
+  DwinSerial.begin(baudDWIN);
+
+  pinMode(R1, OUTPUT);
+  pinMode(R2, OUTPUT);
+  pinMode(R3, OUTPUT);
+  pinMode(R4, OUTPUT);
+  pinMode(R5, OUTPUT);
+  pinMode(R6, OUTPUT);
+  pinMode(AUX1, OUTPUT);
+  pinMode(AUX2, OUTPUT);
+  pinMode(AUX3, OUTPUT);
+  pinMode(FONTE_12V, OUTPUT);
+  pinMode(FONTE_24V, OUTPUT);
+  pinMode(LED_APROVADO, OUTPUT);
+  pinMode(LED_REPROVADO, OUTPUT);
+
+  desligarTudo();
+
+  Serial.println(F("INICIANDO SISTEMA"));
+
+  delay(100);
+
+  if (!SD.begin(PIN_SD_CS)) 
+  {
+    Serial.println(F("SD nao encontrado"));
+  } 
+    else 
+    {
+      Serial.println(F("SD Card OK"));
+    }
+
+  if (!ina226.init()) 
+  {
+    Serial.println(F("ERRO: INA226 não encontrado"));
+  } 
+    else 
+    {
+      Serial.println(F("INA226 OK"));
+    }
+
+  ina226.setAverage(INA226_AVERAGE_16);
+  ina226.setConversionTime(INA226_CONV_TIME_1100);
+  ina226.setMeasureMode(INA226_CONTINUOUS);
+
+  ina226.setResistorRange(SHUNT_RESISTOR, 5.0);
+
+  Serial.println(F("SISTEMA CONTINUA... Tentando carregar menu..."));
+  delay(1000);
+  carregarMenu(0);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void loop() 
+{
+
+  if (telaResultadoAtiva)
+  {
+    if (millis() - tempoTelaResultado >= 4000)
+    {
+      digitalWrite(LED_APROVADO, DESLIGADO);
+      digitalWrite(LED_REPROVADO, DESLIGADO);
+      mudarPaginaDWIN(PAGINA_TESTE);
+      telaResultadoAtiva = false;
+    }
+  }
+
+  while (DwinSerial.available()) 
+  {
+    uint8_t b = DwinSerial.read();
+    dwinRX.process(b);
+  }
+
+  if (dwinRX.frame.complete) 
+  {
+    tratarFrame(dwinRX.frame);
+    dwinRX.frame.complete = false;
+  }
+}
+
+  ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void tratarFrame(DWINFrame &f) 
+{
+  if (f.data[3] != 0x83) return;
+
+  uint16_t key = (f.data[7] << 8) | f.data[8];
+
+  if (key == KEY_TELA1_PAG_PROX) 
+  {
+    paginaListaAtual++;
+    carregarMenu(paginaListaAtual);
+    return;
+  }
+
+  if (key == KEY_TELA1_PAG_ANT && paginaListaAtual > 0) 
+  {
+    paginaListaAtual--;
+    carregarMenu(paginaListaAtual);
+    return;
+  }
+
+  if (f.data[3] == 0x83) 
+  {
+    uint16_t valorLido = (f.data[7] << 8) | f.data[8];
+  }
+
+  if (key >= KEY_TELA1_PRODUTO_BASE && key <= (KEY_TELA1_PRODUTO_BASE + (12 * KEY_TELA1_PRODUTO_PASSO))) 
+  {
+    int slot = ((key - KEY_TELA1_PRODUTO_BASE) / KEY_TELA1_PRODUTO_PASSO) + 1;
+    identificarProdutoSelecionado(slot);
+  }
+
+  if (key == KEY_TELA3_BOTAO_INICIAR) 
+  {
+    autoLoopAtivo = true;  // <<< REATIVA
+    Serial.println(F(">>> BOTAO INICIAR DETECTADO <<<"));
+    executarSequenciaDeTestes();
+    return;
+  }
+
+  if (key == KEY_TELA2_TROCAR_PROD) 
+  {
+    autoLoopAtivo = false;
+    testesEmExecucao = false;
+
+    paginaListaAtual = 0;
+    mudarPaginaDWIN(PAGINA_MENU);
+    carregarMenu(0);
+    return;
+  }
+
+  if (key == KEY_TELA3_HOME) 
+  {
+    if (testesEmExecucao) return;
+    mudarPaginaDWIN(PAGINA_TESTE - 1);
+    return;
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void DWINReceiver::reset()  
+{
+  state = WAIT_H1;
+  idx = 0;
+  len = 0;
+  frame.complete = false;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void DWINReceiver::process(uint8_t b)
+{
+  if (millis() - lastByte > FRAME_TIMEOUT) 
+  {
+    reset();
+  }
+
+  lastByte = millis();
+
+  switch (state) 
+  {
+    case WAIT_H1:
+      if (b == HDR1) 
+      {
+        buf[0] = b;
+        idx = 1;
+        state = WAIT_H2;
+      }
+    break;
+
+      case WAIT_H2:
+        if (b == HDR2) 
+        {
+          buf[1] = b;
+          idx = 2;
+          state = WAIT_LEN;
+        } else reset();
+      break;
+
+        case WAIT_LEN:
+          len = b;
+          buf[2] = b;
+          idx = 3;
+          state = WAIT_DATA;
+        break;
+
+          case WAIT_DATA:
+            buf[idx++] = b;
+            if (idx >= len + 3) 
+            {
+              memcpy(frame.data, buf, idx);
+              frame.size = idx;
+              frame.complete = true;
+              state = WAIT_H1;
+              idx = 0;
+              len = 0;
+            }
+          break;
+  }
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void armazenarProdutoNoVP(String nomeProduto) 
+{
+  delay(50);
+  enviarTextoDWIN(VP_PRODUTO_NOME, nomeProduto, TAM_TEXTO);
+}
+
+
+void processarAcao(byte codigo) 
+{
+  if (codigo == 0xFE) 
+  {
+    paginaListaAtual++;
+    carregarMenu(paginaListaAtual);
+  } 
+    else if (codigo == 0xFD && paginaListaAtual > 0) 
+    {
+      paginaListaAtual--;
+      carregarMenu(paginaListaAtual);
+    } 
+      else if (codigo >= 1 && codigo <= 19) 
+      {
+        if (identificarProdutoSelecionado(codigo)) 
+        {
+          executarSequenciaDeTestes();
+        }
+      }
+        else if (codigo == 0xEE) 
+        {
+          mudarPaginaDWIN(PAGINA_MENU);
+          carregarMenu(0);
+        }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void carregarMenu(int pagina) 
+{
+  for (int i = 0; i < TELA1_ITENS_POR_PAGINA; i++) 
+  {
+    limparTextoVP(TELA1_VP_LISTA + (i * VP_TELA1_MENU_PASSO), TAM_TEXTO);
+  }
+
+  if (!SD.exists("dados.csv")) 
+  {
+    Serial.println(F("ERRO: dados.csv nao existe."));
+    return;
+  }
+
+  File arquivo = SD.open("dados.csv");
+  if (!arquivo) 
+  {
+    Serial.println(F("ERRO: Falha ao abrir dados.csv"));
+    return;
+  }
+
+  String ultimoNome = "";
+  int contadorProdutosUnicos = 0;
+  int inicioPagina = pagina * TELA1_ITENS_POR_PAGINA;
+  int slotTela = 0;
+
+  while (arquivo.available()) 
+  {
+    String linha = arquivo.readStringUntil('\n');
+    linha.trim();
+    linha.replace("\r", "");
+    linha.replace("é", "e");
+    linha.replace("è", "e");
+    linha.replace("ê", "e");
+    linha.replace("á", "a");
+    linha.replace("à", "a");
+    linha.replace("â", "a");
+    linha.replace("ã", "a");
+    linha.replace("í", "i");
+    linha.replace("ì", "i");
+    linha.replace("î", "i");
+    linha.replace("ó", "o");
+    linha.replace("ò", "o");
+    linha.replace("ô", "o");
+    linha.replace("õ", "o");
+    linha.replace("ú", "u");
+    linha.replace("ù", "u");
+    linha.replace("û", "u");
+
+    if (linha.length() < 5 || linha.indexOf("QTE") >= 0 || linha.startsWith("Nome")) 
+    {
+      continue;
+    }
+
+    String nomeAtual = splitString(linha, ';', 0);
+
+    if (!nomeAtual.equalsIgnoreCase(ultimoNome) && nomeAtual.length() > 0) 
+    {
+      if (contadorProdutosUnicos >= inicioPagina) 
+      {
+        if (slotTela < TELA1_ITENS_POR_PAGINA) 
+        {
+          uint16_t enderecoAtual = TELA1_VP_LISTA + (slotTela * 30);
+
+          enviarTextoDWIN(enderecoAtual, nomeAtual, TAM_TEXTO);
+
+          slotTela++;
+        } else 
+        {
+          break;
+        }
+      }
+      contadorProdutosUnicos++;
+      ultimoNome = nomeAtual;
+    }
+  }
+
+  arquivo.close();
+  Serial.println(F("--- Menu Carregado ---"));
+
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+bool identificarProdutoSelecionado(int slotClicado) 
+{
+  int indiceDesejado = (paginaListaAtual * TELA1_ITENS_POR_PAGINA) + (slotClicado - 1);
+
+  File arquivo = SD.open("dados.csv");
+  if (!arquivo) 
+  {
+    Serial.println(F("Erro ao abrir dados.csv"));
+    return false;
+  }
+
+  String ultimoNome = "";
+  int contadorProdutos = -1;
+  bool encontrado = false;
+
+  while (arquivo.available()) 
+  {
+    String linha = arquivo.readStringUntil('\n');
+    linha.trim();
+    linha.replace("\r", "");
+    linha.replace("é", "e");
+    linha.replace("è", "e");
+    linha.replace("ê", "e");
+    linha.replace("á", "a");
+    linha.replace("à", "a");
+    linha.replace("â", "a");
+    linha.replace("ã", "a");
+    linha.replace("í", "i");
+    linha.replace("ì", "i");
+    linha.replace("î", "i");
+    linha.replace("ó", "o");
+    linha.replace("ò", "o");
+    linha.replace("ô", "o");
+    linha.replace("õ", "o");
+    linha.replace("ú", "u");
+    linha.replace("ù", "u");
+    linha.replace("û", "u");
+
+    if (linha.length() < 5 || linha.indexOf("QTE") >= 0 || linha.startsWith("Nome")) continue;
+
+    String nomeAtual = splitString(linha, ';', 0);
+
+    if (nomeAtual != ultimoNome) 
+    {
+      contadorProdutos++;
+      ultimoNome = nomeAtual;
+    }
+
+    if (contadorProdutos == indiceDesejado) 
+    {
+      limparTextoVP(VP_TELA3_ETAPA_EM_TESTE, 25);
+      limparTextoVP(VP_TELA3_TENSAO, 25);
+      limparTextoVP(VP_TELA3_MIN, 25);
+      limparTextoVP(VP_TELA3_MAX, 25);
+
+      nomeProdutoSelecionado = nomeAtual;
+      nomeProdutoSelecionado.trim();
+      armazenarProdutoNoVP(nomeProdutoSelecionado);
+
+      carregarPrimeiraEtapaDoProduto();
+
+      mudarPaginaDWIN(PAGINA_TESTE);
+
+      encontrado = true;
+      break;
+    }
+  }
+  arquivo.close();
+  return encontrado;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void carregarPrimeiraEtapaDoProduto() 
+{
+  File arquivo = SD.open("dados.csv");
+  if (!arquivo) return;
+
+  while (arquivo.available()) 
+  {
+    String linha = arquivo.readStringUntil('\n');
+    linha.trim();
+    linha.replace("\r", "");
+    linha.replace("é", "e");
+    linha.replace("è", "e");
+    linha.replace("ê", "e");
+    linha.replace("á", "a");
+    linha.replace("à", "a");
+    linha.replace("â", "a");
+    linha.replace("ã", "a");
+    linha.replace("í", "i");
+    linha.replace("ì", "i");
+    linha.replace("î", "i");
+    linha.replace("ó", "o");
+    linha.replace("ò", "o");
+    linha.replace("ô", "o");
+    linha.replace("õ", "o");
+    linha.replace("ú", "u");
+    linha.replace("ù", "u");
+    linha.replace("û", "u");
+
+    if (linha.length() < 5 || linha.indexOf("QTE") >= 0 || linha.startsWith("Nome")) continue;
+    String nome = splitString(linha, ';', 0);
+
+    if (nome == nomeProdutoSelecionado) 
+    {
+      String etapa = splitString(linha, ';', 1);
+      String tensao = splitString(linha, ';', 2);
+      String iMin = splitString(linha, ';', 3);
+      String iMax = splitString(linha, ';', 4);
+
+      enviarTextoDWIN(VP_TELA3_ETAPA_EM_TESTE, etapa, TAM_TEXTO);
+      enviarTextoDWIN(VP_TELA3_TENSAO, tensao, TAM_TEXTO);
+      enviarTextoDWIN(VP_TELA3_MIN, iMin, TAM_TEXTO);
+      enviarTextoDWIN(VP_TELA3_MAX, iMax, TAM_TEXTO);
+      enviarFloatDWIN(VP_TELA3_MEDIDA, 0.0);
+
+      break;
+    }
+  }
+  arquivo.close();
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void executarSequenciaDeTestes() 
+{
+  testesEmExecucao = true;
+
+  static bool autoLoop = false;
+
+  if (autoLoop) 
+  {
+    Serial.println(F(">>> REINICIO AUTOMATICO DO TESTE <<<"));
+  }
+  autoLoop = true;
+
+  Serial.println(F(">>> INICIO DA SEQUENCIA DE TESTES <<<"));
+
+  totalEtapasRodadas = 0;
+
+  for (int i = 0; i < MAX_ETAPAS; i++) 
+  {
+    resultados[i].nomeEtapa = "";
+    resultados[i].aprovado = false;
+    resultados[i].correnteLida = 0.0;
+  }
+
+  totalEtapasRodadas = 0;
+
+  File arquivo = SD.open("dados.csv");
+  if (!arquivo) return;
+
+  while (arquivo.available()) 
+  {
+    String linha = arquivo.readStringUntil('\n');
+    linha.trim();
+    linha.replace("\r", "");
+    linha.replace("é", "e");
+    linha.replace("è", "e");
+    linha.replace("ê", "e");
+    linha.replace("á", "a");
+    linha.replace("à", "a");
+    linha.replace("â", "a");
+    linha.replace("ã", "a");
+    linha.replace("í", "i");
+    linha.replace("ì", "i");
+    linha.replace("î", "i");
+    linha.replace("ó", "o");
+    linha.replace("ò", "o");
+    linha.replace("ô", "o");
+    linha.replace("õ", "o");
+    linha.replace("ú", "u");
+    linha.replace("ù", "u");
+    linha.replace("û", "u");
+
+    if (linha.length() < 5 || linha.indexOf("QTE") >= 0 || linha.startsWith("Nome")) continue;
+
+    String nomeNaLinha = splitString(linha, ';', 0);
+    nomeNaLinha.trim();
+
+    if (nomeNaLinha.equalsIgnoreCase(nomeProdutoSelecionado)) 
+    {
+      String nomeEtapa = splitString(linha, ';', 1);
+      String tensaoStr = splitString(linha, ';', 2);
+
+      nomeEtapa.trim();
+      tensaoStr.trim();
+
+      if (nomeEtapa.length() == 0) 
+      {
+        continue;
+      }
+
+      Serial.print("ETAPA VALIDA: ");
+      Serial.println(nomeEtapa);
+      rodarEtapa(linha);
+    }
+  }
+
+  arquivo.close();
+  desligarTudo();
+  delay(300);
+
+  testesEmExecucao = false;
+
+  Serial.print(F("TOTAL ETAPAS GRAVADAS = "));
+  Serial.println(totalEtapasRodadas);
+
+  digitalWrite(LED_APROVADO, DESLIGADO);
+  digitalWrite(LED_REPROVADO, DESLIGADO);
+
+  mostrarTelaResultados();
+  atualizarLedsResultadoFinal();
+
+  // unsigned long t0 = millis();
+  // while (millis() - t0 < 5000) 
+  // {
+  //   while (DwinSerial.available()) 
+  //   {
+  //     uint8_t b = DwinSerial.read();
+  //     dwinRX.process(b);
+  //   }
+
+  //   if (dwinRX.frame.complete) 
+  //   {
+  //     tratarFrame(dwinRX.frame);
+  //     dwinRX.frame.complete = false;
+  //   }
+  // }
+  // mudarPaginaDWIN(PAGINA_TESTE);
+  // delay(200);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void rodarEtapa(String linhaCSV) 
+{
+  String nomeEtapa = splitString(linhaCSV, ';', 1);
+
+  String tStr = splitString(linhaCSV, ';', 2);
+
+  String tStrNum = tStr;
+  tStrNum.replace("V", "");
+  tStrNum.replace("v", "");
+  tStrNum.replace(",", ".");
+  float tensaoRef = tStrNum.toFloat();
+
+  String minStr = splitString(linhaCSV, ';', 3);
+  String maxStr = splitString(linhaCSV, ';', 4);
+
+  minStr.replace(",", ".");
+  maxStr.replace(",", ".");
+
+  minStr.replace(",", ".");
+  maxStr.replace(",", ".");
+
+  float iMin = minStr.toFloat();
+  float iMax = maxStr.toFloat();
+
+  String tempoStr = splitString(linhaCSV, ';', 5);
+  long tempoMs = (tempoStr.length() > 0) ? tempoStr.toInt() : 1000;
+  if (tempoMs < 500) tempoMs = 500;
+
+  enviarTextoDWIN(TELA3_VP_NOME_ETAPA, nomeEtapa, TAM_TEXTO);
+
+  String textoTensao = String(tensaoRef, 1) + "V";
+  enviarTextoDWIN(TELA3_VP_TENSAO, textoTensao, TAM_TEXTO);
+  enviarTextoDWIN(TELA3_VP_MIN, String(iMin, 2), TAM_TEXTO);
+  enviarTextoDWIN(TELA3_VP_MAX, String(iMax, 2), TAM_TEXTO);
+
+  limparTextoVP(TELA3_VP_LEITURA_CORRENTE, TAM_TEXTO);
+  enviarTextoDWIN(TELA3_VP_LEITURA_CORRENTE, "medindo...", TAM_TEXTO);
+
+  String r1 = splitString(linhaCSV, ';', 6);
+  String r2 = splitString(linhaCSV, ';', 7);
+  String reles = r1;
+
+  if (r2.length() > 0) 
+  {
+    if (reles.length() > 0) reles += ",";
+    reles += r2;
+  }
+
+  tratarRelesString(reles);
+
+  if (tensaoRef > 20.0) 
+  {
+    digitalWrite(FONTE_12V, DESLIGADO);
+    digitalWrite(FONTE_24V, LIGADO);
+  } 
+    else if (tensaoRef > 5.0) 
+    {
+      digitalWrite(FONTE_24V, DESLIGADO);
+      digitalWrite(FONTE_12V, LIGADO);
+    } 
+      else 
+      {
+        digitalWrite(FONTE_24V, DESLIGADO);
+        digitalWrite(FONTE_12V, DESLIGADO);
+      }
+
+  unsigned long inicio = millis();
+
+  float correnteFinal = medirCorrente_mA();
+
+  Serial.print("Corrente medida (mA): ");
+  Serial.println(correnteFinal);
+
+  String correnteStr = String(correnteFinal);
+  limparTextoVP(TELA3_VP_LEITURA_CORRENTE, TAM_TEXTO);
+  enviarTextoDWIN(TELA3_VP_LEITURA_CORRENTE, correnteStr, TAM_TEXTO);
+
+  bool aprovado = true;
+
+  if (!(iMin == 0 && iMax == 0)) 
+  {
+    aprovado = ((correnteFinal) >= iMin && (correnteFinal) <= iMax);
+  }
+
+  if (totalEtapasRodadas < MAX_ETAPAS) 
+  {
+    resultados[totalEtapasRodadas].nomeEtapa = nomeEtapa;
+    resultados[totalEtapasRodadas].aprovado = aprovado;
+    resultados[totalEtapasRodadas].correnteLida = correnteFinal;
+    totalEtapasRodadas++;
+  }
+
+  delay(1200);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void tratarRelesString(String texto) 
+{
+  desligarTudo();
+  texto.toUpperCase();
+  texto.replace(" ", "");
+  texto.replace(";", ",");
+
+  Serial.print(F("Reles solicitados: "));
+  Serial.println(texto);
+
+  if (texto.indexOf("E1") != -1) digitalWrite(R1, LIGADO);
+  if (texto.indexOf("E2") != -1) digitalWrite(R2, LIGADO);
+  if (texto.indexOf("E3") != -1) digitalWrite(R3, LIGADO);
+  if (texto.indexOf("E4") != -1) digitalWrite(R4, LIGADO);
+  if (texto.indexOf("E5") != -1) digitalWrite(R5, LIGADO);
+  if (texto.indexOf("E6") != -1) digitalWrite(R6, LIGADO);
+
+  if (texto.indexOf("A1") != -1) digitalWrite(AUX1, LIGADO);
+  if (texto.indexOf("A2") != -1) digitalWrite(AUX2, LIGADO);
+  if (texto.indexOf("A3") != -1) digitalWrite(AUX3, LIGADO);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void desligarTudo() 
+{
+  digitalWrite(R1, DESLIGADO);
+  digitalWrite(R2, DESLIGADO);
+  digitalWrite(R3, DESLIGADO);
+  digitalWrite(R4, DESLIGADO);
+  digitalWrite(R5, DESLIGADO);
+  digitalWrite(R6, DESLIGADO);
+  digitalWrite(AUX1, DESLIGADO);
+  digitalWrite(AUX2, DESLIGADO);
+  digitalWrite(AUX3, DESLIGADO);
+  digitalWrite(FONTE_12V, DESLIGADO);
+  digitalWrite(FONTE_24V, DESLIGADO);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void ligarReles(String command) 
+{
+  desligarTudo();
+  command.toUpperCase();
+
+  if (command.indexOf("E1") >= 0) digitalWrite(R1, LOW);
+  if (command.indexOf("E2") >= 0) digitalWrite(R2, LOW);
+  if (command.indexOf("E3") >= 0) digitalWrite(R3, LOW);
+  if (command.indexOf("E4") >= 0) digitalWrite(R4, LOW);
+  if (command.indexOf("E5") >= 0) digitalWrite(R5, LOW);
+  if (command.indexOf("E6") >= 0) digitalWrite(R6, LOW);
+
+  if (command.indexOf("AUX1") >= 0) digitalWrite(AUX1, LOW);
+  if (command.indexOf("AUX2") >= 0) digitalWrite(AUX2, LOW);
+  if (command.indexOf("AUX3") >= 0) digitalWrite(AUX3, LOW);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+float medirCorrente_mA() 
+{
+  float soma = 0;
+
+  for (int i = 0; i < 10; i++) 
+  {
+    float val = ina226.getCurrent_mA();
+    if (val < 0) val = 0;
+    soma += val;
+    delay(20);
+  }
+
+  return soma / 10.0;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void atualizarLedsResultadoFinal() 
+{
+  bool todasAprovadas = true;
+
+  for (int i = 0; i < totalEtapasRodadas; i++) 
+  {
+    if (!resultados[i].aprovado) 
+    {
+      todasAprovadas = false;
+      break;
+    }
+  }
+
+  digitalWrite(LED_APROVADO, DESLIGADO);
+  digitalWrite(LED_REPROVADO, DESLIGADO);
+
+  if (totalEtapasRodadas == 0) return;
+
+  if (todasAprovadas) 
+  {
+    digitalWrite(LED_APROVADO, LIGADO);
+    //delay(4000);
+    //digitalWrite(LED_APROVADO, DESLIGADO);
+  } 
+  else 
+  {
+    digitalWrite(LED_REPROVADO, LIGADO);
+    //delay(4000);
+    //digitalWrite(LED_REPROVADO, DESLIGADO);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void mostrarTelaResultados() 
+{
+  mudarPaginaDWIN(PAGINA_RESULTADO);
+  tempoTelaResultado = millis();
+  telaResultadoAtiva = true;
+
+  for (int i = 0; i < 15; i++) 
+  {
+    limparTextoVP(TELA4_VP_NOME_BASE + (i * VP_TELA4_RESULTADO_PASSO), TAM_TEXTO);
+    enviarIconeDWIN(TELA4_VP_ICON_BASE + (i * 2), 2);
+  }
+
+  for (int i = 0; i < totalEtapasRodadas; i++) 
+  {
+    String txt = resultados[i].nomeEtapa;
+
+    enviarTextoDWIN(
+      TELA4_VP_NOME_BASE + (i * VP_TELA4_RESULTADO_PASSO),
+      txt,
+      TAM_TEXTO);
+    delay(20);
+
+    int icone = resultados[i].aprovado ? 1 : 0;
+    enviarIconeDWIN(TELA4_VP_ICON_BASE + (i * 2), icone);
+    delay(20);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void mudarPaginaDWIN(byte pagina) 
+{
+  byte command[] = { 0x5A, 0xA5, 0x07, 0x82, 0x00, 0x84, 0x5A, 0x01, 0x00, pagina };
+  DwinSerial.write(command, sizeof(command));
+
+  Serial.print("Mudando para a pagina: ");
+  Serial.println(pagina, HEX);
+
+  delay(300);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void enviarTextoDWIN(uint16_t vp, String texto, int tamanhoCampo = -1) 
+{
+
+  if (tamanhoCampo < 0) 
+  {
+    byte head[] = { 0x5A, 0xA5, (byte)(texto.length() + 3), 0x82, highByte(vp), lowByte(vp) };
+    DwinSerial.write(head, 6);
+    DwinSerial.print(texto);
+  } else 
+  {
+    if (texto.length() > tamanhoCampo)
+      texto = texto.substring(0, tamanhoCampo);
+      byte head[] = { 0x5A, 0xA5, (byte)(tamanhoCampo + 3), 0x82, highByte(vp), lowByte(vp) };
+      DwinSerial.write(head, 6);
+
+        for (uint8_t i = 0; i < texto.length(); i++)
+        DwinSerial.write(texto[i]);
+
+          for (uint8_t i = texto.length(); i < tamanhoCampo; i++)
+          DwinSerial.write(' ');
+  }
+
+  delay(100);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void limparTextoVP(uint16_t vp, uint8_t tamanho) 
+{
+  byte head[] = { 0x5A, 0xA5, (byte)(tamanho + 3), 0x82, highByte(vp), lowByte(vp) };
+  DwinSerial.write(head, 6);
+
+    for (uint8_t i = 0; i < tamanho; i++)
+      DwinSerial.write(' ');
+
+        delay(20);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void enviarFloatDWIN(uint16_t vp, float valor) 
+{
+  int inteiro = (int)valor;
+  int decimal = abs((int)((valor - inteiro) * 100));
+
+  DwinSerial.write(0x5A);
+  DwinSerial.write(0xA5);
+  DwinSerial.write(0x07);
+  DwinSerial.write(0x82);
+
+  DwinSerial.write(highByte(vp));
+  DwinSerial.write(lowByte(vp));
+
+  DwinSerial.write(highByte(inteiro));
+  DwinSerial.write(lowByte(inteiro));
+  DwinSerial.write(highByte(decimal));
+  DwinSerial.write(lowByte(decimal));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void enviarIconeDWIN(uint16_t vp, int idIcone) 
+{
+  byte command[] = { 0x5A, 0xA5, 0x05, 0x82, highByte(vp), lowByte(vp), 0x00, (byte)idIcone };
+  DwinSerial.write(command, 8);
+  delay(10);
+}
+
+String splitString(String data, char separator, int index) 
+{
+  int found = 0;
+  int strIndex[] = { 0, -1 };
+  int maxIndex = data.length() - 1;
+  for (int i = 0; i <= maxIndex && found <= index; i++) 
+  {
+    if (data.charAt(i) == separator || i == maxIndex) 
+    {
+      found++;
+      strIndex[0] = strIndex[1] + 1;
+      strIndex[1] = (i == maxIndex) ? i + 1 : i;
+    }
+  }
+  return found > index ? data.substring(strIndex[0], strIndex[1]) : "";
+}
